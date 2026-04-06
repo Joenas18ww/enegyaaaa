@@ -1,0 +1,4 @@
+
+node_modules/
+start_heliogrid.sh.save*
+HelioGrid/node_modules/
