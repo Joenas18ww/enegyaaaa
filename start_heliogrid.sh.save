@@ -1,0 +1,22 @@
+#!/bin/bash
+# Start Flask
+cd /home/r-pi/HILEOGRID/HelioGrid/src/backend/api
+python3 flask_unified_complete.py &
+
+# Start Vite
+cd /home/r-pi/HILEOGRID/HelioGrid
+npm run dev &
+
+# Start ngrok at kuhanin ang URL
+sleep 5
+ngrok http 3000 &
+sleep 5
+
+# Kuhanin ang bagong ngrok URL
+NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])")
+
+# I-update ang lahat ng .env files
+echo "OAUTH_CALLBACK_BASE=$NGROK_URL" > /home/r-pi/HILEOGRID/HelioGrid/src/backend/api/.env
+echo "FRONTEND_URL=$NGROK_URL" >> /home/r-pi/HILEOGRID/HelioGrid/src/backend/api/.env
+
+echo "✅ ngrok URL: $NGROK_URL"
