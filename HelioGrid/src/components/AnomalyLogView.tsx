@@ -207,15 +207,8 @@ export function AnomalyLogView() {
 
   // ============================================================================
   // STATISTICS
-  // Grid + Inverter AC primary anomalies + Thermal events
-  // [FIX-BUG4] Added thermal/temp to filter — thermal shutdowns must appear in log
-  const acLogs = anomalyLogs.filter(e => {
-    const src = (e.source ?? '').toLowerCase();
-    const typ = (e.type  ?? '').toLowerCase();
-    return src.includes('grid') || src.includes('inverter')
-        || src.includes('thermal') || src.includes('temp')
-        || typ.includes('thermal') || typ.includes('shutdown');
-  });
+  // Keep UI log list aligned with MySQL records shown by backend: no frontend source filtering.
+  const acLogs = anomalyLogs;
 
   const criticalCount = acLogs.filter(e => e.severity === 'Critical').length;
   const highCount     = acLogs.filter(e => e.severity === 'High').length;

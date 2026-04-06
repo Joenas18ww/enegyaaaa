@@ -40,6 +40,8 @@ from typing import Callable, Optional
 
 BUZZER_GPIO_PIN:  int   = 14      # BCM GPIO 14 (physical pin 8)
 BUZZER_DURATION_MS: int = 5_000   # 5 s pulse
+BUZZER_ON_LEVEL: int    = 1       # HIGH = ON
+BUZZER_OFF_LEVEL: int   = 0       # LOW  = OFF
 
 # ---------------------------------------------------------------------------
 # Internal state
@@ -69,7 +71,7 @@ def _init_gpio() -> None:
         import RPi.GPIO as GPIO   # type: ignore
         GPIO.setmode(GPIO.BCM)
         GPIO.setwarnings(False)
-        GPIO.setup(BUZZER_GPIO_PIN, GPIO.OUT, initial=GPIO.LOW)
+        GPIO.setup(BUZZER_GPIO_PIN, GPIO.OUT, initial=GPIO.HIGH if BUZZER_OFF_LEVEL else GPIO.LOW)
         _gpio_mod       = GPIO
         _gpio_available = True
         print(f"[BUZZER] GPIO initialized on BCM {BUZZER_GPIO_PIN}")
@@ -155,7 +157,7 @@ def is_active() -> bool:
 def _hw_on() -> None:
     if _gpio_available and _gpio_mod is not None:
         try:
-            _gpio_mod.output(BUZZER_GPIO_PIN, _gpio_mod.HIGH)
+            _gpio_mod.output(BUZZER_GPIO_PIN, _gpio_mod.HIGH if BUZZER_ON_LEVEL else _gpio_mod.LOW)
             return
         except Exception as e:
             print(f"[BUZZER] GPIO HIGH error: {e}")
@@ -166,7 +168,7 @@ def _hw_on() -> None:
 def _hw_off() -> None:
     if _gpio_available and _gpio_mod is not None:
         try:
-            _gpio_mod.output(BUZZER_GPIO_PIN, _gpio_mod.LOW)
+            _gpio_mod.output(BUZZER_GPIO_PIN, _gpio_mod.HIGH if BUZZER_OFF_LEVEL else _gpio_mod.LOW)
             return
         except Exception as e:
             print(f"[BUZZER] GPIO LOW error: {e}")

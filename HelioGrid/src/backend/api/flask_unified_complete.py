@@ -100,8 +100,8 @@ try:
     print("PZEM-004T readers loaded from Grid.py + Inverter.py")
 except Exception as _pzem_err:
     print(f"PZEM-004T not available: {_pzem_err}")
-INA219_AVAILABLE  = False  # INA219 via battery_reader (fallback path when PZEM017 unavailable)
-PZEM017_AVAILABLE = False  # declared here; set to True after pymodbus import below
+INA219_AVAILABLE  = False  # INA219 battery sensor (primary)
+PZEM017_AVAILABLE = False  # disabled by request; INA219 is the active battery sensor
 
 # [P1-FIX-4] DHT import — uses adafruit_dht (CircuitPython, matches Temp.py)
 #   Sensor type: DHT22 (physical sensor on GPIO27)
@@ -162,34 +162,11 @@ except (ImportError, ModuleNotFoundError):
     pass  # RPi-only module — stubs active on Windows/dev
 
 # =============================================================================
-# ── PZEM-017 DC Battery Meters (replaces INA226) ─────────────────────────────
-# 2x PZEM-017 via USB Hub → USB-TTL03
-# B1 → /dev/ttyBattery1PZEM | B2 → /dev/ttyBattery2PZEM
-# Pack voltage = B1.V + B2.V (series) | Pack current = avg(B1.I, B2.I)
-# Install: pip install pymodbus --break-system-packages
-# Both PZEM-017 on same RS485 bus — USB Hub → ttyUSB3
-# udev: /dev/ttyBatteryPZEM → ttyUSB3 (by USB port path, set after hardware arrives)
-PZEM017_PORT     = "/dev/ttyBatteryPZEM"
-PZEM017_B1_ADDR  = 0x01   # Bank A — Battery 1 (factory default)
-PZEM017_B2_ADDR  = 0x02   # Bank A — Battery 2
-PZEM017_B3_ADDR  = 0x03   # Bank B — Battery 3 (200Ah expansion, plug-and-play)
-PZEM017_B4_ADDR  = 0x04   # Bank B — Battery 4 (200Ah expansion, plug-and-play)
-
-PZEM017_AVAILABLE = False
-_ModbusClient: Any = None
-try:
-    from pymodbus.client import ModbusSerialClient as _ModbusClientImport
-    _ModbusClient     = _ModbusClientImport
-    PZEM017_AVAILABLE = True
-    print("pymodbus imported — PZEM-017 battery monitoring active")
-except ImportError:
-    print("pymodbus not found. Install: pip install pymodbus --break-system-packages")
-
-SENSORS_AVAILABLE = PZEM_AVAILABLE or PZEM017_AVAILABLE
-
-# Legacy stubs — prevent NameError in any old code paths
-INA226_AVAILABLE = False
-_INA226Class: Any = None
+# ── Battery sensor mode ───────────────────────────────────────────────────────
+# PZEM-017 path is intentionally disabled. Battery telemetry is sourced
+# from INA219 (`src/backend/sensors/ina.py`) when available.
+# =============================================================================
+SENSORS_AVAILABLE = PZEM_AVAILABLE or INA219_AVAILABLE
 
 try:
     from settings import I2C_CONFIG as _I2C, UART_CONFIG as _UART
@@ -388,7 +365,7 @@ def ensure_tables():
         )
     """)
 
-    # Add INA226 columns if table existed before v6.0
+    # Add INA219 columns if table existed before v6.0
     for col, definition in [
         ('battery_charge_a',    'DECIMAL(10,3) NULL AFTER system_temp'),
         ('battery_discharge_a', 'DECIMAL(10,3) NULL AFTER battery_charge_a'),
@@ -619,18 +596,13 @@ if PZEM_AVAILABLE and InverterPZEMReader is not None:
     except Exception as e:
         print(f"Inverter PZEM error: {e}"); inverter_pzem = None
 
-if PZEM017_AVAILABLE and _ModbusClient is not None:
-    try:
-        from Battery import PZEM017BatteryReader
-        battery_reader = PZEM017BatteryReader([
-            {"port": PZEM017_PORT, "slave_addr": PZEM017_B1_ADDR, "label": "Battery 1"},
-            {"port": PZEM017_PORT, "slave_addr": PZEM017_B2_ADDR, "label": "Battery 2"},
-            {"port": PZEM017_PORT, "slave_addr": PZEM017_B3_ADDR, "label": "Battery 3"},
-            {"port": PZEM017_PORT, "slave_addr": PZEM017_B4_ADDR, "label": "Battery 4"},
-        ])
-        print("PZEM-017 battery reader initialized")
-    except Exception as e:
-        print(f"PZEM-017 reader init error: {e}")
+try:
+    from ina import read_battery as _read_ina219_battery
+    battery_reader = _read_ina219_battery
+    INA219_AVAILABLE = True
+    print("INA219 battery reader initialized")
+except Exception as e:
+    print(f"INA219 battery reader init error: {e}")
 # Solar INA219 reader removed — solar data now comes from Arduino WCS1500 (A0-A3)
 # and voltage divider (A4) via arduino_get_status() in background_logger.
 solar_reader = None
@@ -644,8 +616,8 @@ cache: Dict[str, Any] = {
     'grid': {}, 'inverter': {}, 'solar': [], 'battery': [],
     'last_update': None,
     'system_temp': 0.0,
-    # [PZEM017] INA226 battery data cache
-    'ina226': {
+    # [PZEM017] INA219 battery data cache
+    'ina219': {
         'voltage':     0.0,
         'charge_a':    0.0,
         'discharge_a': 0.0,
@@ -728,203 +700,61 @@ def read_dht22() -> float:
 
 
 # =============================================================================
-#  [PZEM017] INA226 BATTERY READ FUNCTION
-#  Reads both INA226 modules and returns unified battery data.
-#
-#  Returns dict:
-#    voltage     — battery pack voltage from INA226 #1 (charging side)
-#    charge_a    — positive charging current (Solar/Grid → Battery) from #1
-#    discharge_a — positive discharging current (Battery → Inverter) from #2
-#    net_current — net current: positive=charging, negative=discharging
-#    soc         — calculated SOC from pack voltage
-#    available   — True if at least one INA226 responded
+#  INA219 BATTERY READ FUNCTION
 # =============================================================================
 
-def read_pzem017_battery() -> dict:
-    """
-    [EXPAND-200Ah] Read 2 or 4 PZEM-017 DC meters on shared RS485 bus.
-    Bank B (PZEM#3+#4) is auto-detected — if they respond = 200Ah mode.
-    Returns unified pack + per-bank data + anomaly messages.
-    """
+def read_battery_sensor_data() -> dict:
+    """Return normalized battery metrics from INA219 reader, with safe defaults."""
     result = {
-        'voltage': 0.0, 'current': 0.0, 'net_current': 0.0, 'pack_power': 0.0,
-        'soc': 0.0, 'charge_a': 0.0, 'discharge_a': 0.0,
+        'voltage': 0.0,
+        'current': 0.0,
+        'net_current': 0.0,
+        'pack_power': 0.0,
+        'soc': 0.0,
+        'charge_a': 0.0,
+        'discharge_a': 0.0,
         'available': False,
-        # Bank A
-        'b1_voltage': 0.0, 'b1_current': 0.0, 'b1_available': False,
-        'b2_voltage': 0.0, 'b2_current': 0.0, 'b2_available': False,
-        # Bank B — stays 0 / False until PZEM#3+#4 plug in
+        'b1_voltage': 0.0,
+        'b1_current': 0.0,
+        'b1_available': False,
+        'b2_voltage': 0.0,
+        'b2_current': 0.0,
+        'b2_available': False,
         'bank_b_available': False,
-        'bank_b_voltage':   0.0,
-        'bank_b_current':   0.0,
-        'bank_b_soc':       0.0,
-        'b3_voltage': 0.0, 'b3_current': 0.0, 'b3_available': False,
-        'b4_voltage': 0.0, 'b4_current': 0.0, 'b4_available': False,
-        'capacity_ah':      100,
-        'anomaly_details':  [],
+        'bank_b_voltage': 0.0,
+        'bank_b_current': 0.0,
+        'bank_b_soc': 0.0,
+        'capacity_ah': 100,
+        'anomaly_details': [],
     }
-    if not PZEM017_AVAILABLE or _ModbusClient is None:
+    if not callable(battery_reader):
+        return result
+    try:
+        data = battery_reader()
+        if not isinstance(data, dict):
+            return result
+        result.update(data)
+        # Ensure derived keys remain present for downstream API consumers.
+        voltage = float(result.get('voltage', 0.0) or 0.0)
+        net_current = float(result.get('net_current', result.get('current', 0.0)) or 0.0)
+        result['pack_power'] = round(voltage * net_current, 2)
+        result['charge_a'] = float(result.get('charge_a', max(0.0, net_current)) or 0.0)
+        result['discharge_a'] = float(result.get('discharge_a', max(0.0, -net_current)) or 0.0)
+        if not result.get('soc'):
+            result['soc'] = calculate_pack_soc(voltage)
+        return result
+    except Exception as e:
+        print(f"[INA219] battery read error: {e}")
         return result
 
-    def _read_one(port: str, slave_addr: int = 0x01) -> dict:
-        r = {'voltage': 0.0, 'current': 0.0, 'power': 0.0, 'available': False}
-        try:
-            client = _ModbusClient(port=port, baudrate=9600, bytesize=8,
-                                   parity='N', stopbits=2, timeout=1.0)
-            if not client.connect():
-                return r
-            rr = client.read_input_registers(address=0x0000, count=8, slave=slave_addr)
-            client.close()
-            if rr.isError():
-                return r
-            regs = rr.registers
-            r.update({
-                'voltage':   round(regs[0] * 0.01, 3),
-                'current':   round(regs[1] * 0.01, 3),
-                'power':     round(((regs[3] << 16) | regs[2]) * 0.1, 2),
-                'available': True,
-            })
-        except Exception as e:
-            print(f"[PZEM017] addr=0x{slave_addr:02X} error: {e}")
-        return r
 
-    # ── Read all 4 units ──────────────────────────────────────────────────────
-    b1 = _read_one(PZEM017_PORT, PZEM017_B1_ADDR)
-    b2 = _read_one(PZEM017_PORT, PZEM017_B2_ADDR)
-    b3 = _read_one(PZEM017_PORT, PZEM017_B3_ADDR)
-    b4 = _read_one(PZEM017_PORT, PZEM017_B4_ADDR)
-
-    bank_a_ok = b1['available'] or b2['available']
-    bank_b_ok = b3['available'] or b4['available']
-
-    result['b1_available'] = b1['available']
-    result['b2_available'] = b2['available']
-    result['b3_available'] = b3['available']
-    result['b4_available'] = b4['available']
-    result['available']    = bank_a_ok
-
-    if not bank_a_ok:
-        return result
-
-    # ── Bank A (always present) ───────────────────────────────────────────────
-    a_v1 = b1['voltage'] if b1['available'] else 0.0
-    a_v2 = b2['voltage'] if b2['available'] else 0.0
-    a_i1 = b1['current'] if b1['available'] else 0.0
-    a_i2 = b2['current'] if b2['available'] else 0.0
-    bank_a_voltage = round(a_v1 + a_v2, 3)
-    valid_a_i      = [i for i, ok in [(a_i1, b1['available']), (a_i2, b2['available'])] if ok]
-    bank_a_current = round(sum(valid_a_i) / len(valid_a_i), 3) if valid_a_i else 0.0
-
-    result.update({
-        'b1_voltage': a_v1, 'b1_current': a_i1,
-        'b2_voltage': a_v2, 'b2_current': a_i2,
-    })
-
-    # ── Bank B (optional — 200Ah expansion) ───────────────────────────────────
-    bank_b_voltage = 0.0
-    bank_b_current = 0.0
-    bank_b_soc     = 0.0
-    b_v1 = b_v2 = 0.0
-    if bank_b_ok:
-        b_v1 = b3['voltage'] if b3['available'] else 0.0
-        b_v2 = b4['voltage'] if b4['available'] else 0.0
-        b_i1 = b3['current'] if b3['available'] else 0.0
-        b_i2 = b4['current'] if b4['available'] else 0.0
-        bank_b_voltage = round(b_v1 + b_v2, 3)
-        valid_b_i      = [i for i, ok in [(b_i1, b3['available']), (b_i2, b4['available'])] if ok]
-        bank_b_current = round(sum(valid_b_i) / len(valid_b_i), 3) if valid_b_i else 0.0
-        bank_b_soc     = calculate_pack_soc(bank_b_voltage)
-        result.update({
-            'bank_b_available': True,
-            'bank_b_voltage':   bank_b_voltage,
-            'bank_b_current':   bank_b_current,
-            'bank_b_soc':       bank_b_soc,
-            'b3_voltage': b_v1, 'b3_current': b3.get('current', 0),
-            'b4_voltage': b_v2, 'b4_current': b4.get('current', 0),
-        })
-
-    # ── Pack totals ───────────────────────────────────────────────────────────
-    if bank_b_ok:
-        # 200Ah — parallel banks: avg voltage, sum current
-        pack_voltage = round((bank_a_voltage + bank_b_voltage) / 2, 3)
-        pack_current = round(bank_a_current + bank_b_current, 3)
-        capacity_ah  = 200
-    else:
-        # 100Ah — single bank series
-        pack_voltage = bank_a_voltage
-        pack_current = bank_a_current
-        capacity_ah  = 100
-
-    pack_soc   = calculate_pack_soc(pack_voltage)
-    pack_power = round(pack_voltage * pack_current, 2)
-
-    result.update({
-        'voltage':      pack_voltage,
-        'current':      pack_current,
-        'net_current':  pack_current,
-        'pack_power':   pack_power,
-        'soc':          pack_soc,
-        'charge_a':     round(max(0.0, pack_current), 3),
-        'discharge_a':  round(max(0.0, -pack_current), 3),
-        'capacity_ah':  capacity_ah,
-    })
-
-    # ── Anomaly detection ─────────────────────────────────────────────────────
-    anomaly_details = []
-
-    # Pack: deep discharge / overcharge / low
-    if pack_voltage > 0:
-        if pack_voltage < 21.6:
-            anomaly_details.append(
-                f'Pack {pack_voltage:.2f}V DEEP DISCHARGE ({pack_soc:.0f}% SOC)')
-        elif pack_voltage > 27.6:
-            anomaly_details.append(
-                f'Pack {pack_voltage:.2f}V OVERCHARGE — check charge controller')
-        elif pack_voltage < 23.0:
-            anomaly_details.append(
-                f'Pack {pack_voltage:.2f}V LOW ({pack_soc:.0f}% SOC)')
-
-    # Bank A cell imbalance (B1 vs B2)
-    if b1['available'] and b2['available']:
-        diff = abs(a_v1 - a_v2)
-        if diff > 0.3:
-            anomaly_details.append(
-                f'BankA imbalance: B1={a_v1:.2f}V B2={a_v2:.2f}V diff={diff:.2f}V')
-
-    # Bank B cell imbalance (B3 vs B4)
-    if bank_b_ok and b3['available'] and b4['available']:
-        diff = abs(b_v1 - b_v2)
-        if diff > 0.3:
-            anomaly_details.append(
-                f'BankB imbalance: B3={b_v1:.2f}V B4={b_v2:.2f}V diff={diff:.2f}V')
-
-    # Bank-to-bank imbalance (200Ah mode)
-    if bank_b_ok:
-        bank_diff = abs(bank_a_voltage - bank_b_voltage)
-        if bank_diff > 0.5:
-            anomaly_details.append(
-                f'Bank mismatch: BankA={bank_a_voltage:.2f}V BankB={bank_b_voltage:.2f}V diff={bank_diff:.2f}V')
-
-    # Overcurrent per bank
-    if abs(bank_a_current) > 75:
-        anomaly_details.append(f'BankA overcurrent {bank_a_current:+.1f}A > 75A warn')
-    if bank_b_ok and abs(bank_b_current) > 75:
-        anomaly_details.append(f'BankB overcurrent {bank_b_current:+.1f}A > 75A warn')
-
-    result['anomaly_details'] = anomaly_details
-
-    print(
-        f"[PZEM017] BankA={bank_a_voltage:.2f}V/{bank_a_current:+.2f}A"
-        + (f" | BankB={bank_b_voltage:.2f}V/{bank_b_current:+.2f}A" if bank_b_ok else " | BankB=offline")
-        + f" | Pack={pack_voltage:.2f}V/{pack_current:+.2f}A SOC={pack_soc:.0f}% {capacity_ah}Ah"
-        + (f" ⚠ {anomaly_details}" if anomaly_details else "")
-    )
-    return result
+# Legacy aliases for old call sites
+def read_ina219_battery() -> dict:
+    return read_battery_sensor_data()
 
 
-# Alias for any remaining old references
-def read_ina226_battery() -> dict:
-    return read_pzem017_battery()
+def read_pzem017_battery() -> dict:
+    return read_battery_sensor_data()
 
 
 def _is_daytime() -> bool:
@@ -1032,11 +862,11 @@ def _send_email_alert(
         inv_f   = cache.get('inverter', {}).get('frequency', 0)
         solar_w = sum(p.get('power', 0) for p in cache.get('solar', []) if 'error' not in p)
 
-        # [PZEM017] Use INA226 voltage if available, else INA219 fallback
-        ina226_data = cache.get('ina226', {})
-        if ina226_data.get('available') and ina226_data.get('voltage', 0) > 0:
-            bat_v   = ina226_data['voltage']
-            bat_soc = ina226_data['soc']
+        # [PZEM017] Use INA219 voltage if available, else INA219 fallback
+        ina219_data = cache.get('ina219', {})
+        if ina219_data.get('available') and ina219_data.get('voltage', 0) > 0:
+            bat_v   = ina219_data['voltage']
+            bat_soc = ina219_data['soc']
         else:
             bat_v   = sum(c.get('voltage', 0) for c in cache.get('battery', []) if 'error' not in c)
             bat_soc = calculate_pack_soc(bat_v)
@@ -1456,7 +1286,7 @@ def check_thermal(system_temp: float, cursor, pack_soc: float, solar_w: float, g
 
 # =============================================================================
 #  BACKGROUND LOGGER
-#  [PZEM017] INA226 read replaces INA219 battery read when available
+#  [PZEM017] INA219 read replaces INA219 battery read when available
 # =============================================================================
 
 _last_rtc_sync: float = 0.0
@@ -1490,8 +1320,8 @@ def background_logger() -> None:
 
             # ── [P1-FIX-5] Thermal check ────────────────────────────────────
             # [FIX-THERMAL-SOC] pack_soc=0 here because battery hasn't been read yet.
-            # Use previous cycle's cached ina226 SOC so thermal email has correct SOC.
-            _cached_soc = cache.get('ina226', {}).get('soc', pack_soc)
+            # Use previous cycle's cached ina219 SOC so thermal email has correct SOC.
+            _cached_soc = cache.get('ina219', {}).get('soc', pack_soc)
             check_thermal(system_temp, cursor, _cached_soc, dc_power, gv)
 
             # ── GRID PZEM ───────────────────────────────────────────────────
@@ -1749,50 +1579,26 @@ def background_logger() -> None:
                 # Arduino not responding or solar key missing — keep last cache
                 dc_power = cache.get('solarPower', 0.0)
 
-            # ── [PZEM017] BATTERY READ ────────────────────────────────────────
-            if PZEM017_AVAILABLE:
-                ina226_data = read_pzem017_battery()
-                cache['ina226'] = ina226_data
+            # ── Battery read (INA219 primary; legacy function name retained) ──
+            ina219_data = read_pzem017_battery()
+            cache['ina219'] = ina219_data
 
-                if ina226_data['available'] and ina226_data['voltage'] > 0:
-                    pack_voltage = ina226_data['voltage']
-                    pack_current = ina226_data['net_current']
-                    pack_soc     = ina226_data['soc']
-
-                    log_data['battery_pack_voltage'] = pack_voltage
-                    log_data['battery_pack_current'] = pack_current
-                    log_data['battery_pack_power']   = round(pack_voltage * pack_current, 2)
-                    log_data['battery_pack_soc']     = pack_soc
-                    log_data['battery_charge_a']     = ina226_data['charge_a']
-                    log_data['battery_discharge_a']  = ina226_data['discharge_a']
-
-                    print(f"[PZEM017] Pack: {pack_voltage:.2f}V | SOC: {pack_soc:.1f}% | "
-                          f"Net: {pack_current:+.2f}A "
-                          f"(chg={ina226_data['charge_a']:.2f}A / "
-                          f"dis={ina226_data['discharge_a']:.2f}A)")
-
-                    # Auto-update battery_capacity_ah in DB
-                    detected_ah = ina226_data.get('capacity_ah', 100)
-                    try:
-                        cursor.execute(
-                            "UPDATE system_config SET config_val=%s WHERE config_key='battery_capacity_ah'",
-                            (str(detected_ah),)
-                        )
-                    except Exception as _cap_err:
-                        print(f"[BATTERY] capacity_ah DB update error: {_cap_err}")
-
-            elif battery_reader:
-                cells        = battery_reader.read_all_sensors()
-                cache['battery'] = cells
-                pack_voltage = sum(c.get('voltage', 0) for c in cells if 'error' not in c)
-                valid_c      = [c.get('current', 0) for c in cells if 'error' not in c]
-                pack_current = sum(valid_c) / len(valid_c) if valid_c else 0
-                pack_soc     = calculate_pack_soc(pack_voltage)
+            if ina219_data.get('available') and ina219_data.get('voltage', 0) > 0:
+                pack_voltage = ina219_data.get('voltage', 0.0)
+                pack_current = ina219_data.get('net_current', ina219_data.get('current', 0.0))
+                pack_soc     = ina219_data.get('soc', 0.0)
 
                 log_data['battery_pack_voltage'] = pack_voltage
                 log_data['battery_pack_current'] = pack_current
-                log_data['battery_pack_power']   = pack_voltage * pack_current
+                log_data['battery_pack_power']   = round(pack_voltage * pack_current, 2)
                 log_data['battery_pack_soc']     = pack_soc
+                log_data['battery_charge_a']     = ina219_data.get('charge_a', max(0.0, pack_current))
+                log_data['battery_discharge_a']  = ina219_data.get('discharge_a', max(0.0, -pack_current))
+
+                print(f"[BATTERY] Pack: {pack_voltage:.2f}V | SOC: {pack_soc:.1f}% | "
+                      f"Net: {pack_current:+.2f}A "
+                      f"(chg={log_data['battery_charge_a']:.2f}A / "
+                      f"dis={log_data['battery_discharge_a']:.2f}A)")
 
             # ── Efficiency computation ────────────────────────────────────────
             # System Efficiency = P_out(inverter) / P_in(grid + solar) × 100
@@ -2015,7 +1821,7 @@ def system_health():
     except Exception as e:
         db_status = f"error: {str(e)}"
 
-    ina226_data = cache.get('ina226', {})
+    ina219_data = cache.get('ina219', {})
 
     return jsonify({
         "status":    "healthy" if db_status == "connected" else "degraded",
@@ -2037,9 +1843,9 @@ def system_health():
             "inverter_pzem":   inverter_pzem is not None,
             "arduino":         arduino is not None and arduino.is_open,
             "dht_sensor":      DHT_AVAILABLE,
-            "pzem017_b1":      ina226_data.get('b1_available', False),
-            "pzem017_b2":      ina226_data.get('b2_available', False),
-            "pzem017_library": PZEM017_AVAILABLE,
+            "ina219_b1":       ina219_data.get('b1_available', False),
+            "ina219_b2":       ina219_data.get('b2_available', False),
+            "ina219_library":  INA219_AVAILABLE,
         },
         "rtc_ds3231":  get_rtc_status(),
         "sensors": {
@@ -2049,18 +1855,18 @@ def system_health():
             "battery_cells": len(cache['battery']),
             "arduino":       "connected" if arduino and arduino.is_open else "disconnected",
             "dht22":         "available" if DHT_AVAILABLE else "not installed",
-            "pzem017_library":   "available" if PZEM017_AVAILABLE else "not installed (pip install pymodbus)",
-            "pzem017_b1":       f"{PZEM017_PORT} slave=0x{PZEM017_B1_ADDR:02X} — {'responding' if ina226_data.get('b1_available') else 'not connected'}",
-            "pzem017_b2":       f"{PZEM017_PORT} slave=0x{PZEM017_B2_ADDR:02X} — {'responding' if ina226_data.get('b2_available') else 'not connected'}",
-            "battery_mode":     "PZEM-017" if PZEM017_AVAILABLE and ina226_data.get('available') else "no battery sensor",
+            "ina219_library": "available" if INA219_AVAILABLE else "not installed (pip install adafruit-circuitpython-ina219)",
+            "ina219_b1":      f"I2C 0x41 — {'responding' if ina219_data.get('b1_available') else 'not connected'}",
+            "ina219_b2":      f"I2C 0x44 — {'responding' if ina219_data.get('b2_available') else 'not connected'}",
+            "battery_mode":   "INA219" if INA219_AVAILABLE and ina219_data.get('available') else "no battery sensor",
         },
-        "battery_ina226": {
-            "voltage":     ina226_data.get('voltage',     0),
-            "charge_a":    ina226_data.get('charge_a',    0),
-            "discharge_a": ina226_data.get('discharge_a', 0),
-            "net_current": ina226_data.get('net_current', 0),
-            "soc":         ina226_data.get('soc',         0),
-            "available":   ina226_data.get('available',   False),
+        "battery_ina219": {
+            "voltage":     ina219_data.get('voltage',     0),
+            "charge_a":    ina219_data.get('charge_a',    0),
+            "discharge_a": ina219_data.get('discharge_a', 0),
+            "net_current": ina219_data.get('net_current', 0),
+            "soc":         ina219_data.get('soc',         0),
+            "available":   ina219_data.get('available',   False),
         },
         "thermal": {
             "current_temp":    cache.get('system_temp', 0),
@@ -2096,7 +1902,7 @@ def system_refresh():
 
 # =============================================================================
 #  CURRENT SENSOR DATA
-#  [PZEM017] Battery data now sourced from INA226 when available
+#  [PZEM017] Battery data now sourced from INA219 when available
 # =============================================================================
 
 @app.route("/api/sensor-data/current", methods=["GET"])
@@ -2116,12 +1922,12 @@ def get_current_sensor_data():
         k2_on = bool(ssr_row.get("ssr2_state", 0))
         current_source = "Solar (SSR1/K1)" if k1_on else "Grid (SSR2/K2)" if k2_on else "None"
 
-        # [PZEM017] Use INA226 data if available, else INA219 fallback
-        ina226_data = cache.get('ina226', {})
-        if PZEM017_AVAILABLE and ina226_data.get('available') and ina226_data.get('voltage', 0) > 0:
-            pack_voltage = ina226_data['voltage']
-            pack_current = ina226_data['net_current']
-            pack_soc     = ina226_data['soc']
+        # Use INA219 cache data if available, else fallback from legacy battery cache
+        ina219_data = cache.get('ina219', {})
+        if INA219_AVAILABLE and ina219_data.get('available') and ina219_data.get('voltage', 0) > 0:
+            pack_voltage = ina219_data['voltage']
+            pack_current = ina219_data['net_current']
+            pack_soc     = ina219_data['soc']
             battery_source = "INA219"
         else:
             pack_voltage = sum(c.get('voltage', 0) for c in cache['battery'] if 'error' not in c)
@@ -2168,16 +1974,16 @@ def get_current_sensor_data():
                 "soc":          pack_soc,
                 "power":        round(pack_voltage * pack_current, 2),
                 # [PZEM017] Extra fields for dashboard display
-                "charge_a":     round(ina226_data.get('charge_a',    0), 2),
-                "discharge_a":  round(ina226_data.get('discharge_a', 0), 2),
+                "charge_a":     round(ina219_data.get('charge_a',    0), 2),
+                "discharge_a":  round(ina219_data.get('discharge_a', 0), 2),
                 "source":       battery_source,
                 # [EXPAND-200Ah] Bank B — 0/False when not connected, live when PZEM#3+#4 online
-                "bank_b_available": ina226_data.get('bank_b_available', False),
-                "bank_b_voltage":   round(ina226_data.get('bank_b_voltage', 0), 2),
-                "bank_b_current":   round(ina226_data.get('bank_b_current', 0), 2),
-                "bank_b_soc":       ina226_data.get('bank_b_soc', 0),
-                "capacity_ah":      ina226_data.get('capacity_ah', 100),
-                "anomaly_details":  ina226_data.get('anomaly_details', []),
+                "bank_b_available": ina219_data.get('bank_b_available', False),
+                "bank_b_voltage":   round(ina219_data.get('bank_b_voltage', 0), 2),
+                "bank_b_current":   round(ina219_data.get('bank_b_current', 0), 2),
+                "bank_b_soc":       ina219_data.get('bank_b_soc', 0),
+                "capacity_ah":      ina219_data.get('capacity_ah', 100),
+                "anomaly_details":  ina219_data.get('anomaly_details', []),
             },
             "inverter": {
                 "voltage":   cache['inverter'].get('voltage',   0),
@@ -2963,7 +2769,7 @@ def get_buzzer_state():
 @app.route("/api/debug/alert-state", methods=["GET"])
 def debug_alert_state():
     now = time.time()
-    ina226_data = cache.get('ina226', {})
+    ina219_data = cache.get('ina219', {})
     return jsonify({
         "fault_states":   dict(_fault_state),
         "fault_counters": dict(_fault_counters),
@@ -2978,19 +2784,18 @@ def debug_alert_state():
             "current_temp":    cache.get('system_temp', 0),
             "dht22_available": DHT_AVAILABLE,
         },
-        # [PZEM017] INA226 debug info
-        "ina226": {
-            "library_available": PZEM017_AVAILABLE,
-            "hardware_responding": ina226_data.get('available', False),
-            "voltage":     ina226_data.get('voltage',     0),
-            "charge_a":    ina226_data.get('charge_a',    0),
-            "discharge_a": ina226_data.get('discharge_a', 0),
-            "net_current": ina226_data.get('net_current', 0),
-            "soc":         ina226_data.get('soc',         0),
-            "pzem017_port":     PZEM017_PORT,
-            "b1_addr":          f"0x{PZEM017_B1_ADDR:02X}",
-            "b1_voltage":      ina226_data.get("b1_voltage", 0),
-            "b2_voltage":      ina226_data.get("b2_voltage", 0),
+        # INA219 debug info
+        "ina219": {
+            "library_available": INA219_AVAILABLE,
+            "hardware_responding": ina219_data.get('available', False),
+            "voltage":     ina219_data.get('voltage',     0),
+            "charge_a":    ina219_data.get('charge_a',    0),
+            "discharge_a": ina219_data.get('discharge_a', 0),
+            "net_current": ina219_data.get('net_current', 0),
+            "soc":         ina219_data.get('soc',         0),
+            "sensor_type": "INA219",
+            "b1_voltage":      ina219_data.get("b1_voltage", 0),
+            "b2_voltage":      ina219_data.get("b2_voltage", 0),
         },
         "cooldowns": {
             k: f"{int(EMAIL_COOLDOWN_DEFAULT_S - (now - t))}s remaining"
@@ -3033,7 +2838,7 @@ def auth_callback():
 
 if __name__ == "__main__":
     print("\n" + "=" * 70)
-    print("  HELIOGRID — UNIFIED FLASK API SERVER  (v6.0 — PZEM-017 Battery)")
+    print("  HELIOGRID — UNIFIED FLASK API SERVER  (INA219 Battery Mode)")
     print("=" * 70)
     print(f"  Arduino Pin Map (v4.3):")
     print(f"    RPi GPIO14 → Buzzer (moved from Arduino Pin 8 in v4.3)")
@@ -3041,12 +2846,8 @@ if __name__ == "__main__":
     print(f"    Pin  4 → SSR2 = K2 → Grid bypass   (Grid → ATS-B → Load)")
     print(f"    Pin  3 → SSR3 = K3 → Grid Assist  (auto only, IEEE 1547)")
     print(f"    Pin  5 → SSR4 = K4 → Contactor → Outlets")
-    print(f"\n  [PZEM017] Battery Current Sensor:")
-    print(f"    Port: {PZEM017_PORT} (USB Hub → ttyUSB3)")
-    print(f"    B1: slave=0x{PZEM017_B1_ADDR:02X} — 12V 100Ah bottom battery")
-    print(f"    B2: slave=0x{PZEM017_B2_ADDR:02X} — 12V 100Ah top battery")
-    print(f"    Library:  {'AVAILABLE' if PZEM017_AVAILABLE else 'NOT INSTALLED — pip install pymodbus --break-system-packages'}")
-    print(f"    pymodbus: {'AVAILABLE' if PZEM017_AVAILABLE else 'NOT INSTALLED — pip install pymodbus --break-system-packages'}")
+    print("\n  [INA219] Battery Current Sensor:")
+    print(f"    Library: {'AVAILABLE' if INA219_AVAILABLE else 'NOT INSTALLED — pip install adafruit-circuitpython-ina219'}")
     print(f"\n  Phase 1 Fixes (v5.0) still active:")
     print(f"    [P1-FIX-1..6] detected_at, resolved_at, inverter_power,")
     print(f"                  {DHT_TYPE}, thermal shutdown, sensor guard")
@@ -3068,11 +2869,11 @@ if __name__ == "__main__":
 
     arduino_connected = arduino is not None and arduino.is_open
     # [FIX-LOGGING] Always start background_logger regardless of hardware.
-    # Old gate (SENSORS_AVAILABLE or PZEM017_AVAILABLE or arduino_connected or DHT_AVAILABLE)
+    # Old gate (SENSORS_AVAILABLE or INA219_AVAILABLE or arduino_connected or DHT_AVAILABLE)
     # caused silent no-op when all flags are False — sensor_logs table stayed empty
     # even though data was arriving via /api/sensor-data/current from another source.
     # Logger already uses setdefault(0.0) for all fields so it's safe with no hardware.
     threading.Thread(target=background_logger, daemon=True).start()
-    print(f"Background sensor logger started (hardware: PZEM={SENSORS_AVAILABLE}, PZEM017={PZEM017_AVAILABLE}, Arduino={arduino_connected}, DHT={DHT_AVAILABLE})")
+    print(f"Background sensor logger started (hardware: PZEM={SENSORS_AVAILABLE}, INA219={INA219_AVAILABLE}, Arduino={arduino_connected}, DHT={DHT_AVAILABLE})")
     print("\nServer starting on http://0.0.0.0:5000\n")
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

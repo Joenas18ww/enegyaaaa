@@ -56,11 +56,8 @@ export function SystemStatusCard() {
       const data = await res.json();
       const allLogs: { severity?: string; type?: string; source?: string }[] =
         Array.isArray(data) ? data : (data.logs ?? []);
-      // [SYNC] Same filter as AnomalyLogView — Grid + Inverter AC only
-      const logs = allLogs.filter(l => {
-        const src = (l.source ?? '').toLowerCase();
-        return src.includes('grid') || src.includes('inverter');
-      });
+      // Keep System Status counters aligned with backend/MySQL records (no frontend source filtering).
+      const logs = allLogs;
       // [FIX] Flask inserts Title Case ("Critical","Warning") — compare lowercase
       const warning  = logs.filter(l => l.severity?.toLowerCase() === 'warning').length;
       const critical = logs.filter(l =>

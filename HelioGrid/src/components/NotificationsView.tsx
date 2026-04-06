@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle, Mail, Clock, Filter, Download, Search, Bell, Zap, Sun, Battery, Grid3x3, TrendingUp, Shield, AlertCircle, RefreshCw, Trash2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle, Mail, Clock, Filter, Download, Search, Bell, Zap, Sun, Battery, Grid3x3, TrendingUp, Shield, AlertCircle, RefreshCw } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { useState, useEffect } from 'react';
 import { useEnergySystem } from '../contexts/EnergySystemContext';
@@ -34,37 +34,19 @@ function friendlyLabel(type: string, severity: string): string {
   if (t.includes('spike'))    return t.includes('low') ? '📉 Spike — Low Voltage' : '📈 Spike — High Voltage';
   if (t.includes('drift'))    return t.includes('low') ? '↘ Drift — Low Voltage' : '↗ Drift — High Voltage';
   if (t.includes('thermal') || t.includes('temp')) return isCrit ? '🌡 Thermal Shutdown' : '🌡 High Temperature';
-  return type ? type.replace(/_/g, ' ').replace(/\w/g, c => c.toUpperCase()) : 'System Event';
+  return type ? type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : 'System Event';
 }
 
 export function NotificationsView() {
   const { anomalyLogs, emailServiceHealth, refreshData } = useEnergySystem();
+  // Finalization mode: anomaly logs stay read-only in UI while anomaly engine is under active changes.
+  const anomalyEngineHold = (import.meta.env.VITE_ANOMALY_ENGINE_HOLD ?? 'true').toLowerCase() !== 'false';
   const [filterSeverity, setFilterSeverity] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [isDeleting, setIsDeleting] = useState(false);
-  const [deleteMsg, setDeleteMsg] = useState('');
 
-  const handleDeleteAll = async () => {
-    if (!confirm('Delete ALL notification logs? This cannot be undone.')) return;
-    setIsDeleting(true);
-    try {
-      // [FIX-BUG2] Flask DELETE handler is on /api/anomaly-events, not /api/anomaly-logs
-      const res = await fetch('/api/anomaly-events', { method: 'DELETE' });
-      if (res.ok) { setDeleteMsg('Deleted!'); refreshData(); }
-      else setDeleteMsg('Failed');
-    } catch { setDeleteMsg('Error'); }
-    setTimeout(() => { setIsDeleting(false); setDeleteMsg(''); }, 2000);
-  };
-
-  // Convert anomaly logs to notifications format using the correct AnomalyLogEntry fields
-  // [FIX] Grid + Inverter AC only — same filter as AnomalyLogView and SystemStatusCard
-  const acAnomalyLogs = anomalyLogs.filter((log: AnomalyLogEntry) => {
-    const src = (log.source ?? '').toLowerCase();
-    return src.includes('grid') || src.includes('inverter');
-  });
-
-  const notifications: Notification[] = acAnomalyLogs.map((log: AnomalyLogEntry) => {
+  // Keep notifications aligned with backend/MySQL anomaly records (no frontend source filtering).
+  const notifications: Notification[] = anomalyLogs.map((log: AnomalyLogEntry) => {
     const date = new Date(log.timestamp);
 
     // Map the context's severity string to our local union
@@ -82,9 +64,9 @@ export function NotificationsView() {
       faultType:    friendlyLabel(log.type, log.severity),  // [FIX-BUG4] use friendly label
       severity,
       source:       log.source,
-      affectedLoad: log.source.includes('Grid')    ? 'All Loads'    :
-                    log.source.includes('Battery') ? 'System'       :
-                    log.source.includes('Solar') || log.source.includes('Panel') ? 'PV Array (2S2P)' : 'System',
+      affectedLoad: (log.source ?? '').toLowerCase().includes('grid')    ? 'All Loads'    :
+                    (log.source ?? '').toLowerCase().includes('battery') ? 'System'       :
+                    (log.source ?? '').toLowerCase().includes('solar') || (log.source ?? '').toLowerCase().includes('panel') ? 'PV Array (2S2P)' : 'System',
       systemAction: log.systemAction,
       gridVoltage:  log.gridVoltage,
       solarPower:   log.solarPower,
@@ -136,7 +118,7 @@ export function NotificationsView() {
   useEffect(() => {
     const id = setInterval(() => { refreshData(); }, 30_000);
     return () => clearInterval(id);
-  }, []);
+  }, [refreshData]);
 
   const filteredNotifications = notifications.filter(notif => {
     const matchesSeverity = filterSeverity === 'all' || notif.severity === filterSeverity;
@@ -185,6 +167,11 @@ export function NotificationsView() {
             <p className="text-xs sm:text-sm lg:text-base text-slate-600">
               Real-time system fault detection and automated response tracking
             </p>
+            {anomalyEngineHold && (
+              <p className="inline-block text-xs sm:text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2 py-1">
+                HOLD MODE: Anomaly engine is read-only habang fina-finalize ang system.
+              </p>
+            )}
           </div>
           <button
             onClick={handleRefresh}

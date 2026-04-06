@@ -1,16 +1,24 @@
 #!/bin/bash
-echo "======================================"
-echo "🚀 Starting HelioGrid System..."
-echo "======================================"
 
-# Config Paths
-BASE_DIR="/home/r-pi/HILEOGRID/HelioGrid"
+# Config Paths (single-command friendly: works from any current directory)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="${BASE_DIR:-$SCRIPT_DIR}"
 API_DIR="$BASE_DIR/src/backend/api"
 SENSORS_DIR="$BASE_DIR/src/backend/sensors"
 ANOMALY_DIR="$BASE_DIR/src/backend/anomaly"
 BUZZER_DIR="$BASE_DIR/src/backend/buzzer"
 EMAIL_DIR="$BASE_DIR/src/backend/email"
 NGROK_DOMAIN="nonprotecting-abstersive-thaddeus.ngrok-free.dev"
+MYSQL_HOST="${MYSQL_HOST:-localhost}"
+MYSQL_PORT="${MYSQL_PORT:-3306}"
+MYSQL_USER="${MYSQL_USER:-root}"
+MYSQL_PASSWORD="${MYSQL_PASSWORD:-}"
+MYSQL_DATABASE="${MYSQL_DATABASE:-smart_energy_db}"
+
+echo "======================================"
+echo "🚀 Starting HelioGrid System..."
+echo "📁 BASE_DIR: $BASE_DIR"
+echo "======================================"
 
 # 1. Kill existing processes
 echo "🧹 Cleaning up old processes..."
@@ -22,7 +30,7 @@ sleep 2
 
 # 2. Fix missing DB columns (safe — IF NOT EXISTS)
 echo "🗄️  Checking DB columns..."
-mysql -u root -pEnergy#123 smart_energy_db -e "
+MYSQL_PWD="$MYSQL_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" "$MYSQL_DATABASE" -e "
 ALTER TABLE sensor_logs
   ADD COLUMN IF NOT EXISTS ssr1_state           TINYINT(1)   NULL,
   ADD COLUMN IF NOT EXISTS ssr2_state           TINYINT(1)   NULL,
@@ -37,7 +45,7 @@ ALTER TABLE sensor_logs
   ADD COLUMN IF NOT EXISTS battery_discharge_a  FLOAT        DEFAULT 0;
 ALTER TABLE anomaly_logs
   ADD COLUMN IF NOT EXISTS inverter_voltage DECIMAL(7,2) NULL;
-" 2>/dev/null && echo "   ✅ DB columns OK" || echo "   ⚠️  DB column check failed (non-fatal)"
+" 2>/dev/null && echo "   ✅ DB columns OK" || echo "   ⚠️  DB column check failed (non-fatal — check MYSQL_* env vars)"
 
 # 3. Copy anomaly_engine + buzzer_controller to api/
 echo "📦 Syncing modules to api/..."

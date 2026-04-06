@@ -26,11 +26,10 @@ import {
   INV_CRITICAL_LOW, INV_CRITICAL_HIGH,
   SOLAR_CRITICAL_LOW, SOLAR_WARNING_LOW,
 } from '../contexts/EnergySystemContext';
-import { EnergyFlowScreensaver } from './cards/Energyflowscreensaver';
 import * as api from '../utils/api';
 import solarImg from '../assets/4panels.jpg';
 
-type ViewType = 'main' | 'grid' | 'solar' | 'battery' | 'panels' | 'graph' | 'ssr' | 'theme' | 'screensaver';
+type ViewType = 'main' | 'grid' | 'solar' | 'battery' | 'panels' | 'graph' | 'ssr' | 'theme';
 type ControlModeType = 'solar' | 'grid' | 'shutdown' | 'failsafe';
 
 interface Theme { id: string; name: string; gradient: string; borderColor: string; textColor: string; }
@@ -41,8 +40,6 @@ const themes: Theme[] = [
   { id: 'forest',   name: 'Forest Green',    gradient: 'from-slate-950 via-green-950 to-slate-950',  borderColor: 'border-green-700',  textColor: 'text-green-400' },
   { id: 'midnight', name: 'Midnight Purple', gradient: 'from-slate-950 via-purple-950 to-slate-950', borderColor: 'border-purple-700', textColor: 'text-purple-400' },
 ];
-
-const SCREENSAVER_IDLE_MS = 40_000;
 
 // All thresholds imported from EnergySystemContext — single source of truth
 // GRID_NORMAL_LOW=210, GRID_NORMAL_HIGH=241, GRID_CRITICAL_LOW=200, GRID_CRITICAL_HIGH=245
@@ -89,31 +86,17 @@ export function KioskLCD() {
     setCurrentView(view);
   };
 
-  // [FIX-SCREENSAVER] Reset idle timer on ANY user interaction, not just navigation
-  const [lastActivity, setLastActivity] = useState(Date.now());
-  useEffect(() => {
-    const reset = () => setLastActivity(Date.now());
-    window.addEventListener('touchstart', reset);
-    window.addEventListener('mousedown', reset);
-    window.addEventListener('keydown', reset);
-    return () => {
-      window.removeEventListener('touchstart', reset);
-      window.removeEventListener('mousedown', reset);
-      window.removeEventListener('keydown', reset);
-    };
-  }, []);
+  // [SIMPLIFY] Screensaver scenario removed for now to reduce kiosk conflicts
+  // while anomaly engine + monitoring + SSR management are being prioritized.
 
   useEffect(() => {
-    if (currentView === 'screensaver') return;
-    const id = setTimeout(() => { setAnimClass('animate-slide-up'); setCurrentView('screensaver'); }, SCREENSAVER_IDLE_MS);
-    return () => clearTimeout(id);
-  }, [currentView, lastActivity]);
-
-  const wakeFromScreensaver = () => { setAnimClass('animate-slide-down'); setCurrentView('main'); };
-
-  useEffect(() => {
-    if (systemData.gridVoltage !== undefined && systemData.gridVoltage !== 0) setIsDataLoaded(true);
-  }, [systemData.gridVoltage]);
+    const hasAnyLiveMetric =
+      Number(systemData.gridVoltage ?? 0) > 0 ||
+      Number(systemData.inverterVoltage ?? 0) > 0 ||
+      Number(systemData.solarVoltage ?? 0) > 0 ||
+      Number(systemData.batteryVoltage ?? 0) > 0;
+    if (hasAnyLiveMetric) setIsDataLoaded(true);
+  }, [systemData.gridVoltage, systemData.inverterVoltage, systemData.solarVoltage, systemData.batteryVoltage]);
 
   // [FIX-OUTLET] Sync outlet status from context whenever it changes
   useEffect(() => {
@@ -124,7 +107,8 @@ export function KioskLCD() {
   const acVoltage_raw   = systemData.inverterVoltage ?? 0;
   const acCurrent_raw   = systemData.inverterCurrent ?? 0;
   const solarPower_raw: number = Number(systemData.solarPower ?? 0);  // [BUG-FIX] Number()
-  const battCurrent_raw = Math.abs(systemData.batteryCurrent ?? 0);
+  const battCurrentSigned_raw = Number(systemData.batteryCurrent ?? 0);
+  const battCurrent_raw = Math.abs(battCurrentSigned_raw);
   const battVoltage_raw = systemData.batteryVoltage  ?? 0;
   const serverTime      = systemData.serverTime      ?? '';
 
@@ -188,7 +172,7 @@ export function KioskLCD() {
               battery: parseFloat(conChart.reduce((s: number, d: any) => s + d.Battery * ih, 0).toFixed(2)),
             });
           } else {
-            const batDis = battCurrent_raw < 0 ? Math.abs(battCurrent_raw) * battVoltage_raw : 0;
+            const batDis = battCurrentSigned_raw < 0 ? Math.abs(battCurrentSigned_raw) * battVoltage_raw : 0;
             setHistoryData([{ time: now, batteryVoltage: 0, gridVoltage: 0, inverterVoltage: 0, solarVoltage: 0, solarPowerW: 0, totalLoad: 0, gridCurrent: 0, solarCurrent: 0, batteryCurrent: 0, inverterCurrent: 0, anomaly: false, voltageAnomalyY: null, currentAnomalyY: null }]);
             setBalanceData([{ time: now, solarSupply: parseFloat(solarPower_raw.toFixed(1)), gridSupply: 0, totalSupply: parseFloat(solarPower_raw.toFixed(1)), totalLoad: parseFloat((acVoltage_raw * acCurrent_raw).toFixed(1)) }]);
             setConsumptionData([{ time: now, Solar: parseFloat(solarPower_raw.toFixed(1)), Grid: 0, Battery: parseFloat(batDis.toFixed(1)) }]);
@@ -2276,8 +2260,6 @@ const renderThemeSelector = () => (
 // ============================================================================
 const renderView = () => {
   switch (currentView) {
-    case "screensaver":
-      return <EnergyFlowScreensaver onWake={wakeFromScreensaver} />;
     case "grid":
       return renderGridDetail();
     case "solar":

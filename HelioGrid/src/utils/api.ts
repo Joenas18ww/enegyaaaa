@@ -11,16 +11,26 @@
 
 const RASPBERRY_PI_IP = '172.20.10.12';
 
+const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, '');
+
+const joinUrl = (base: string, path: string): string => {
+  const normalizedBase = trimTrailingSlash(base);
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+
+  // For relative base (e.g. ""), keep the path relative.
+  if (!normalizedBase) return normalizedPath;
+  return `${normalizedBase}${normalizedPath}`;
+};
+
 const getApiBaseUrl = (): string => {
-  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
-  return '/api';
+  const configuredApiUrl = import.meta.env.VITE_API_URL?.trim();
+  return configuredApiUrl ? trimTrailingSlash(configuredApiUrl) : '/api';
 };
 
 const getAuthBaseUrl = (): string => {
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL.replace(/\/api$/, '');
-  }
-  return '';
+  const configuredApiUrl = import.meta.env.VITE_API_URL?.trim();
+  if (!configuredApiUrl) return '';
+  return trimTrailingSlash(configuredApiUrl).replace(/\/api$/, '');
 };
 
 const API_BASE_URL = getApiBaseUrl();
@@ -208,7 +218,7 @@ export interface BuzzerState {
 // ============================================================================
 
 async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  const url = `${API_BASE_URL}${endpoint}`;
+  const url = joinUrl(API_BASE_URL, endpoint);
   try {
     const response = await fetch(url, {
       ...options,
@@ -236,11 +246,14 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
 // ============================================================================
 
 export function loginWithGoogle(): void {
-  window.location.href = '/auth/google';
+  window.location.href = joinUrl(AUTH_BASE_URL, '/auth/google');
 }
 
 export async function logout(): Promise<void> {
-  await fetch('/auth/logout');
+  await fetch(joinUrl(AUTH_BASE_URL, '/auth/logout'), {
+    method: 'POST',
+    credentials: 'include',
+  });
 }
 
 export function parseAuthFromUrl(): { email: string; name: string; picture: string } | null {
